@@ -234,6 +234,7 @@ export type AuditAction =
   | "user.login"
   | "user.logout"
   | "user.mfa_verified"
+  | "user.register"
   | "document.uploaded"
   | "document.verified"
   | "document.flagged"
@@ -244,7 +245,25 @@ export type AuditAction =
   | "payroll.approved"
   | "compliance.checked"
   | "report.generated"
-  | "settings.updated";
+  | "report.viewed"
+  | "settings.updated"
+  // ── Event-driven audit trail (RabbitMQ consumers) ── //
+  | "bank_slip.analysis.started"
+  | "bank_slip.analysis.completed"
+  | "bank_slip.analysis.failed"
+  | "payroll.analysis.started"
+  | "payroll.analysis.completed"
+  | "payroll.analysis.failed"
+  | "document.analysis.started"
+  | "document.analysis.completed"
+  | "document.analysis.failed"
+  | "bill.scheduled"
+  | "bill.cancelled"
+  | "bill.paid"
+  | "bill.due_soon"
+  | "bill.overdue"
+  | "notification.created"
+  | "notification.read";
 
 // ── Notification ── //
 

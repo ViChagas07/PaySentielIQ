@@ -4,11 +4,13 @@
 # ============================================================
 
 import asyncio
+import uuid
 from collections.abc import AsyncGenerator
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -43,6 +45,17 @@ async def test_engine():
         "sqlite+aiosqlite:///:memory:",
         echo=False,
     )
+
+    # ── gen_random_uuid() shim ──────────────────────────────────────
+    # Base models use server_default=gen_random_uuid() (PostgreSQL).
+    # SQLite has no such function — register a UUIDv4 generator so
+    # inserts without an explicit PK work in tests.
+    @event.listens_for(engine.sync_engine, "connect")
+    def _register_sqlite_functions(dbapi_connection, connection_record):
+        dbapi_connection.create_function(
+            "gen_random_uuid", 0, lambda: str(uuid.uuid4())
+        )
+
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield engine
@@ -59,6 +72,20 @@ async def db_session(test_engine) -> AsyncGenerator[AsyncSession, None]:
     )
     async with session_factory() as session:
         yield session
+
+
+@pytest_asyncio.fixture
+async def session_factory(test_engine):
+    """Provide a session factory bound to the shared test engine.
+
+    Used by messaging handlers/workers, which create their own sessions
+    internally (mirrors production behavior).
+    """
+    return async_sessionmaker(
+        test_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
 
 
 @pytest_asyncio.fixture

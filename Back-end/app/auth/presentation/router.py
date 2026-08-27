@@ -4,6 +4,7 @@
 # LGPD-compliant: consent required for all authentication methods
 # ============================================================
 
+import logging
 import uuid
 from datetime import datetime, timezone as dt_timezone
 from typing import Any
@@ -25,6 +26,7 @@ from app.shared.settings import get_settings
 
 settings = get_settings()
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # ── Request/Response Schemas ──
@@ -271,12 +273,26 @@ async def login(request: Request, body: LoginRequest) -> TokenResponse:
     )
     raw_refresh, hashed_refresh = AuthService.create_refresh_token(mock_user_id)
 
+    await _publish_user_action(
+        {"sub": mock_user_id, "tenant_id": mock_tenant_id},
+        "login",
+        ip_address=_client_ip(request),
+        user_agent=request.headers.get("User-Agent"),
+    )
+
     return TokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
         expires_in=900,  # 15 minutes
         requires_mfa=False,
     )
+
+
+def _client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
 
 
 @router.post("/mfa/verify", response_model=TokenResponse)
@@ -359,4 +375,38 @@ async def logout(payload: dict[str, Any] = Depends(get_token_payload)) -> dict[s
     Logout: revoke all refresh tokens for this user.
     """
     # In production: revoke refresh tokens, clear sessions
+    await _publish_user_action(payload, "logout")
     return {"message": "Logged out successfully"}
+
+
+# ═══════════════════════════════════════════════════════════════
+# EVENT PUBLISHING (user.action — feeds the activity history)
+# ═══════════════════════════════════════════════════════════════
+
+
+async def _publish_user_action(
+    payload: dict[str, Any],
+    action: str,
+    *,
+    ip_address: str | None = None,
+    user_agent: str | None = None,
+) -> None:
+    """Publish a `user.action` event to the activity history (non-fatal)."""
+    try:
+        from app.messaging.domain.envelope import new_event
+        from app.messaging.domain.event_types import EventType
+        from app.messaging.infrastructure.factory import get_event_publisher
+
+        event = new_event(
+            EventType.USER_ACTION.value,
+            payload={
+                "action": action,
+                "ip_address": ip_address,
+                "user_agent": user_agent,
+            },
+            user_id=payload.get("sub"),
+            tenant_id=payload.get("tenant_id"),
+        )
+        await get_event_publisher().publish(event)
+    except Exception as exc:  # pragma: no cover - audit of auth must never fail
+        logger.warning("user.action publish failed (non-fatal): %s", exc)

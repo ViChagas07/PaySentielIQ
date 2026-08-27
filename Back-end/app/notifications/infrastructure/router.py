@@ -18,6 +18,40 @@ from app.notifications.services import NotificationService
 router = APIRouter()
 
 
+def _service(db: AsyncSession) -> NotificationService:
+    """Build the NotificationService with the process-wide event publisher."""
+    from app.messaging.infrastructure.factory import get_event_publisher
+
+    return NotificationService(db, event_publisher=get_event_publisher())
+
+
+async def _publish_notification_read(
+    user_id: str,
+    tenant_id: str,
+    *,
+    notification_ids: list[str],
+) -> None:
+    """Publish notification.read for the activity history (non-fatal)."""
+    try:
+        from app.messaging.domain.envelope import new_event
+        from app.messaging.domain.event_types import EventType
+        from app.messaging.infrastructure.factory import get_event_publisher
+
+        event = new_event(
+            EventType.NOTIFICATION_READ.value,
+            payload={"notification_ids": notification_ids[:50]},
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        await get_event_publisher().publish(event)
+    except Exception:  # pragma: no cover - audit must never fail the endpoint
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "notification.read publish failed (non-fatal)", exc_info=True
+        )
+
+
 # ── Response Models ──
 
 
@@ -86,7 +120,7 @@ async def list_notifications(
     Returns real data from the database — no mock fallbacks.
     """
     try:
-        service = NotificationService(db)
+        service = _service(db)
         notifications = await service.get_notifications_for_user(
             user_id=uuid.UUID(user_id),
             skip=(page - 1) * page_size,
@@ -131,16 +165,20 @@ async def get_unread_count(
 async def mark_as_read(
     notification_id: str,
     user_id: str = Depends(get_current_user_id),
+    tenant_id: str = Depends(get_current_tenant_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Mark a single notification as read."""
     try:
-        service = NotificationService(db)
+        service = _service(db)
         notification = await service.mark_notification_as_read(
             notification_id=uuid.UUID(notification_id),
             user_id=uuid.UUID(user_id),
         )
         await db.commit()
+        await _publish_notification_read(
+            user_id, tenant_id, notification_ids=[notification_id]
+        )
         return {
             "status": "read",
             "notification_id": str(notification.id),
@@ -184,13 +222,15 @@ async def mark_as_unread(
 @router.post("/read-all")
 async def mark_all_read(
     user_id: str = Depends(get_current_user_id),
+    tenant_id: str = Depends(get_current_tenant_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Mark all unread notifications as read for the current user."""
     try:
-        service = NotificationService(db)
+        service = _service(db)
         count = await service.mark_all_notifications_as_read(user_id=uuid.UUID(user_id))
         await db.commit()
+        await _publish_notification_read(user_id, tenant_id, notification_ids=["*"])
         return {"status": "all_read", "marked_count": count}
     except HTTPException:
         await db.rollback()

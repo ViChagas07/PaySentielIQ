@@ -5,7 +5,6 @@
 
 import asyncio
 import logging
-import sys
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -94,7 +93,6 @@ async def _background_run_migrations() -> None:
         if engine is None:
             return
         # Use SQLAlchemy create_all for all registered models
-        from sqlalchemy.ext.asyncio import AsyncSession
         async with engine.begin() as conn:
             from app.shared.orm_models import Base
             await conn.run_sync(Base.metadata.create_all)
@@ -121,7 +119,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # ── Start WebSocket Redis listener (Celery → WS bridge) ──
     try:
-        from app.websocket.router import start_ws_redis_listener, stop_ws_redis_listener
+        from app.websocket.router import start_ws_redis_listener
         _ws_redis_task = asyncio.create_task(start_ws_redis_listener())
         print("[psi] WebSocket Redis listener started", flush=True)
     except Exception as exc:
@@ -161,6 +159,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await close_redis()
     except Exception as exc:
         logger.warning("Redis shutdown error (non-fatal): %s", exc)
+    try:
+        from app.messaging.infrastructure.factory import close_event_publisher
+        await close_event_publisher()
+    except Exception as exc:
+        logger.warning("Event publisher shutdown error (non-fatal): %s", exc)
     try:
         if engine is not None:
             await engine.dispose()
@@ -295,6 +298,13 @@ def create_app() -> FastAPI:
         except Exception as exc:
             checks["status"] = "degraded"
             checks["dependencies"]["redis"] = {"status": "unhealthy", "error": str(exc)}
+        # RabbitMQ
+        try:
+            from app.observability.health import _check_rabbitmq
+            checks["dependencies"]["rabbitmq"] = await _check_rabbitmq()
+        except Exception as exc:
+            checks["status"] = "degraded"
+            checks["dependencies"]["rabbitmq"] = {"status": "unhealthy", "error": str(exc)}
         # LLM
         try:
             from app.ai_agents.llm_service import get_llm_service

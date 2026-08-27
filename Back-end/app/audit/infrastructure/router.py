@@ -1,263 +1,118 @@
 # ============================================================
-# PaySentinelIQ — Audit Logs Router (Read-Only)
+# PaySentinelIQ — Audit Logs Router (Activity History / Relatórios)
+# ============================================================
+# Read-only feed backed by the immutable `audit_logs` table, which is
+# fed asynchronously by the `sentinel.audit` RabbitMQ consumer.
+# The frontend NEVER queries RabbitMQ — it reads this API.
+#
+# Endpoints:
+#   GET /api/audit-logs     — tenant-wide timeline (auditor roles)
+#   GET /api/audit-logs/me  — current user's own activity (any role)
 # ============================================================
 
+from __future__ import annotations
 
+import logging
+import uuid
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth.dependencies import get_current_tenant_id, require_auditor
+from app.audit.application.service import AuditLogFilter, AuditLogService
+from app.auth.dependencies import get_current_tenant_id, get_current_user_id, require_auditor
+from app.shared.database import get_db
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# ── Rich mock audit log entries ──
-
-_MOCK_AUDIT_LOGS = [
+_ACTIONS = frozenset(
     {
-        "id": "al-001",
-        "tenant_id": "t1",
-        "user_id": "user-001",
-        "user_name": "Sarah Mitchell",
-        "action": "fraud.alert_reviewed",
-        "entity_type": "fraud_alert",
-        "entity_id": "FR-002",
-        "details": {"resolution": "Escalated to compliance team", "review_time_seconds": 340},
-        "ip_address": "192.168.1.45",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-16T14:30:00Z",
-    },
-    {
-        "id": "al-002",
-        "tenant_id": "t1",
-        "user_id": "user-001",
-        "user_name": "Sarah Mitchell",
-        "action": "user.login",
-        "entity_type": "user",
-        "entity_id": "user-001",
-        "details": {"method": "password", "mfa_verified": True, "ip": "192.168.1.45"},
-        "ip_address": "192.168.1.45",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-16T08:00:00Z",
-    },
-    {
-        "id": "al-003",
-        "tenant_id": "t1",
-        "user_id": "user-002",
-        "user_name": "Carlos Oliveira",
-        "action": "document.uploaded",
-        "entity_type": "document",
-        "entity_id": "doc-014",
-        "details": {
-            "file_name": "Q2_Payroll_2025.pdf",
-            "file_size_bytes": 2457600,
-            "document_type": "payroll_report",
-        },
-        "ip_address": "192.168.1.52",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "created_at": "2025-05-16T09:45:00Z",
-    },
-    {
-        "id": "al-004",
-        "tenant_id": "t1",
-        "user_id": "user-002",
-        "user_name": "Carlos Oliveira",
-        "action": "fraud.alert_created",
-        "entity_type": "fraud_alert",
-        "entity_id": "FR-001",
-        "details": {
-            "risk_score": 72,
-            "anomaly_category": "salary_discrepancy",
-            "ai_confidence": 0.92,
-        },
-        "ip_address": "192.168.1.52",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "created_at": "2025-05-16T09:15:00Z",
-    },
-    {
-        "id": "al-005",
-        "tenant_id": "t1",
-        "user_id": "user-003",
-        "user_name": "Ana Silva",
-        "action": "compliance.checked",
-        "entity_type": "compliance_report",
-        "entity_id": "comp-001",
-        "details": {
-            "entity_name": "Acme Corporation",
-            "result": "verified",
-            "checks_performed": ["sanctions", "pep", "adverse_media"],
-        },
-        "ip_address": "192.168.1.60",
-        "user_agent": "Mozilla/5.0 (X11; Linux x86_64)",
-        "created_at": "2025-05-15T16:00:00Z",
-    },
-    {
-        "id": "al-006",
-        "tenant_id": "t1",
-        "user_id": "user-004",
-        "user_name": "Roberto Lima",
-        "action": "payroll.created",
-        "entity_type": "payroll",
-        "entity_id": "pr-001",
-        "details": {
-            "employee_name": "John D. Smith",
-            "gross_pay": 14250.00,
-            "period": "2025-05-01 to 2025-05-15",
-        },
-        "ip_address": "192.168.1.70",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-16T08:00:00Z",
-    },
-    {
-        "id": "al-007",
-        "tenant_id": "t1",
-        "user_id": "user-004",
-        "user_name": "Roberto Lima",
-        "action": "payroll.approved",
-        "entity_type": "payroll",
-        "entity_id": "pr-004",
-        "details": {"approved_by": "Roberto Lima", "risk_score": 10, "verified_by_ai": True},
-        "ip_address": "192.168.1.70",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-14T16:00:00Z",
-    },
-    {
-        "id": "al-008",
-        "tenant_id": "t1",
-        "user_id": "user-001",
-        "user_name": "Sarah Mitchell",
-        "action": "fraud.alert_resolved",
-        "entity_type": "fraud_alert",
-        "entity_id": "FR-007",
-        "details": {
-            "resolution": "false_positive",
-            "notes": "Schema version mismatch only — no financial impact",
-        },
-        "ip_address": "192.168.1.45",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-13T14:00:00Z",
-    },
-    {
-        "id": "al-009",
-        "tenant_id": "t1",
-        "user_id": "user-005",
-        "user_name": "Julia Costa",
-        "action": "document.verified",
-        "entity_type": "document",
-        "entity_id": "doc-005",
-        "details": {"ocr_confidence": 97.5, "risk_score": 47, "fraud_indicators_found": 2},
-        "ip_address": "192.168.1.80",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "created_at": "2025-05-14T11:30:00Z",
-    },
-    {
-        "id": "al-010",
-        "tenant_id": "t1",
-        "user_id": "user-001",
-        "user_name": "Sarah Mitchell",
-        "action": "report.generated",
-        "entity_type": "report",
-        "entity_id": "rpt-003",
-        "details": {"report_type": "monthly_fraud_summary", "period": "2025-04", "format": "pdf"},
-        "ip_address": "192.168.1.45",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-12T10:00:00Z",
-    },
-    {
-        "id": "al-011",
-        "tenant_id": "t1",
-        "user_id": "user-002",
-        "user_name": "Carlos Oliveira",
-        "action": "settings.updated",
-        "entity_type": "settings",
-        "entity_id": "user-002",
-        "details": {
-            "changed_fields": ["alert_threshold", "email_notifications"],
-            "old_threshold": 70,
-            "new_threshold": 60,
-        },
-        "ip_address": "192.168.1.52",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-        "created_at": "2025-05-15T14:20:00Z",
-    },
-    {
-        "id": "al-012",
-        "tenant_id": "t1",
-        "user_id": "user-003",
-        "user_name": "Ana Silva",
-        "action": "document.flagged",
-        "entity_type": "document",
-        "entity_id": "doc-012",
-        "details": {"risk_level": "critical", "anomaly": "tax_evasion", "risk_score": 93},
-        "ip_address": "192.168.1.60",
-        "user_agent": "Mozilla/5.0 (X11; Linux x86_64)",
-        "created_at": "2025-05-10T11:30:00Z",
-    },
-    {
-        "id": "al-013",
-        "tenant_id": "t1",
-        "user_id": "user-001",
-        "user_name": "Sarah Mitchell",
-        "action": "user.logout",
-        "entity_type": "user",
-        "entity_id": "user-001",
-        "details": {"session_duration_minutes": 480},
-        "ip_address": "192.168.1.45",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-15T18:00:00Z",
-    },
-    {
-        "id": "al-014",
-        "tenant_id": "t1",
-        "user_id": "user-001",
-        "user_name": "Sarah Mitchell",
-        "action": "user.mfa_verified",
-        "entity_type": "user",
-        "entity_id": "user-001",
-        "details": {"method": "totp", "verified": True},
-        "ip_address": "192.168.1.45",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-16T08:01:00Z",
-    },
-    {
-        "id": "al-015",
-        "tenant_id": "t1",
-        "user_id": "user-004",
-        "user_name": "Roberto Lima",
-        "action": "payroll.created",
-        "entity_type": "payroll",
-        "entity_id": "pr-003",
-        "details": {
-            "employee_name": "Robert Chen",
-            "gross_pay": 21500.00,
-            "period": "2025-05-01 to 2025-05-15",
-        },
-        "ip_address": "192.168.1.70",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "created_at": "2025-05-14T10:30:00Z",
-    },
-]
+        "user.action",
+        "bank_slip.analysis.started",
+        "bank_slip.analysis.completed",
+        "bank_slip.analysis.failed",
+        "payroll.analysis.started",
+        "payroll.analysis.completed",
+        "payroll.analysis.failed",
+        "document.analysis.started",
+        "document.analysis.completed",
+        "document.analysis.failed",
+        "bill.scheduled",
+        "bill.cancelled",
+        "bill.paid",
+        "bill.due_soon",
+        "bill.overdue",
+        "notification.created",
+        "notification.read",
+        "report.viewed",
+    }
+)
 
 
-def _filter_audit_logs(
-    action: str | None = None,
-    user_id: str | None = None,
-    entity_type: str | None = None,
-    from_date: str | None = None,
-    to_date: str | None = None,
-) -> list[dict[str, Any]]:
-    result: list[dict[str, Any]] = _MOCK_AUDIT_LOGS
-    if action:
-        result = [rec for rec in result if rec["action"] == action]
+def _parse_filter(
+    action: str | None,
+    user_id: str | None,
+    entity_type: str | None,
+    action_icontains: str | None,
+    created_after: str | None,
+    created_before: str | None,
+    page: int,
+    page_size: int,
+) -> AuditLogFilter:
+    """Translate raw query params into a validated AuditLogFilter."""
+
+    def _dt(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    parsed_user_id: uuid.UUID | None = None
     if user_id:
-        result = [rec for rec in result if rec["user_id"] == user_id]
-    if entity_type:
-        result = [rec for rec in result if rec["entity_type"] == entity_type]
-    if from_date is not None:
-        result = [rec for rec in result if str(rec.get("created_at", "")) >= from_date]
-    if to_date is not None:
-        result = [rec for rec in result if str(rec.get("created_at", "")) <= to_date]
-    return result
+        try:
+            parsed_user_id = uuid.UUID(user_id)
+        except ValueError:
+            parsed_user_id = None
+
+    return AuditLogFilter(
+        user_id=parsed_user_id,
+        action=action or None,
+        entity_type=entity_type or None,
+        action_icontains=action_icontains or None,
+        created_after=_dt(created_after),
+        created_before=_dt(created_before),
+        page=page,
+        page_size=page_size,
+    )
+
+
+async def _publish_report_view(
+    tenant_id: str, user_id: str, payload: dict[str, Any]
+) -> None:
+    """Emit `report.viewed` for the activity-history view (page 1 only).
+
+    Deliberately NOT published on pagination/polling requests to avoid
+    flooding the audit trail with trivial reads.
+    """
+    try:
+        from app.messaging.domain.envelope import new_event
+        from app.messaging.domain.event_types import EventType
+        from app.messaging.infrastructure.factory import get_event_publisher
+
+        event = new_event(
+            EventType.REPORT_VIEWED.value,
+            payload=payload,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        await get_event_publisher().publish(event)
+    except Exception as exc:  # pragma: no cover - audit of audit must never fail
+        logger.warning("report.viewed publish failed (non-fatal): %s", exc)
 
 
 @router.get("")
@@ -269,22 +124,77 @@ async def list_audit_logs(
     action: str | None = None,
     user_id: str | None = None,
     entity_type: str | None = None,
-    from_date: str | None = None,
-    to_date: str | None = None,
+    action_icontains: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    from_date: str | None = None,  # legacy alias of created_after
+    to_date: str | None = None,  # legacy alias of created_before
+    db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
+    """List immutable activity history for the tenant (paginated).
+
+    Filters: action, user_id, entity_type, action__icontains,
+    created_after/created_before (ISO-8601). Read-only by design.
     """
-    List immutable audit log entries.
-    Read-only — audit logs are append-only by design.
-    """
-    filtered = _filter_audit_logs(action, user_id, entity_type, from_date, to_date)
-    total = len(filtered)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    start = (page - 1) * page_size
-    end = start + page_size
-    return {
-        "data": filtered[start:end],
-        "total": total,
-        "page": page,
-        "page_size": page_size,
-        "total_pages": total_pages,
-    }
+    filters = _parse_filter(
+        action=action,
+        user_id=user_id,
+        entity_type=entity_type,
+        action_icontains=action_icontains,
+        created_after=created_after or from_date,
+        created_before=created_before or to_date,
+        page=page,
+        page_size=page_size,
+    )
+    service = AuditLogService(db)
+    result = await service.list_for_tenant(uuid.UUID(tenant_id), filters)
+
+    # Auditing the audit view itself (page 1 only — avoids polling noise).
+    if page == 1:
+        await _publish_report_view(
+            tenant_id,
+            str(payload["sub"]),
+            {
+                "report": "activity_history",
+                "filters": {
+                    k: v
+                    for k, v in {
+                        "action": action,
+                        "entity_type": entity_type,
+                        "created_after": created_after or from_date,
+                    }.items()
+                    if v
+                },
+            },
+        )
+    return result.to_response()
+
+
+@router.get("/me")
+async def list_my_audit_logs(
+    user_id: str = Depends(get_current_user_id),
+    tenant_id: str = Depends(get_current_tenant_id),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    action: str | None = None,
+    entity_type: str | None = None,
+    created_after: str | None = None,
+    created_before: str | None = None,
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """List the authenticated user's own activity (self-service, any role)."""
+    filters = _parse_filter(
+        action=action,
+        user_id=None,
+        entity_type=entity_type,
+        action_icontains=None,
+        created_after=created_after,
+        created_before=created_before,
+        page=page,
+        page_size=page_size,
+    )
+    service = AuditLogService(db)
+    result = await service.list_for_user(
+        uuid.UUID(tenant_id), uuid.UUID(user_id), filters
+    )
+    return result.to_response()

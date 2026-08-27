@@ -56,14 +56,54 @@ async def analyze_document(
 
     document_id = str(uuid.uuid4())
 
+    # ── Publish analysis started event (activity history) ──
+    from app.messaging.domain.event_types import analysis_event_types
+    started_type, completed_type, failed_type = analysis_event_types(document_type)
+    await _publish_analysis_event(
+        started_type,
+        document_id=document_id,
+        document_type=document_type,
+        file_name=file_name,
+        user_id=user_id,
+        tenant_id=tenant_id,
+    )
+
     # ── Use CanonicalPipeline if feature flag enabled ──
     use_canonical = getattr(settings, "USE_CANONICAL_PIPELINE", False)
 
-    if use_canonical:
-        return await _run_canonical(file_data, document_type, document_id, file_name, mime_type, tenant_id, user_id, observations)
+    try:
+        if use_canonical:
+            result = await _run_canonical(file_data, document_type, document_id, file_name, mime_type, tenant_id, user_id, observations)
+        else:
+            # ── Fallback: legacy pipeline ──
+            result = await _run_legacy(file_data, document_type, document_id, file_name, mime_type, tenant_id, observations)
 
-    # ── Fallback: legacy pipeline ──
-    return await _run_legacy(file_data, document_type, document_id, file_name, mime_type, tenant_id, observations)
+        # ── Publish analysis completed event ──
+        await _publish_analysis_event(
+            completed_type,
+            document_id=document_id,
+            document_type=document_type,
+            file_name=file_name,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            risk_score=_safe_risk_score(result),
+            risk_level=str(result.get("risk_level") or result.get("RISK_ASSESSMENT", {}).get("risk_classification", "")),
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Analysis pipeline failed for %s", document_id)
+        await _publish_analysis_event(
+            failed_type,
+            document_id=document_id,
+            document_type=document_type,
+            file_name=file_name,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            error=str(exc)[:300],
+        )
+        raise
 
 
 async def _run_canonical(
@@ -229,6 +269,64 @@ def _build_extracted_metadata(ctx) -> dict:
         "document_type": ctx.document_type,
         "file_name": ctx.filename,
     }
+
+
+def _safe_risk_score(result: dict[str, Any]) -> float | None:
+    """Extract a numeric risk score from legacy or canonical responses."""
+    try:
+        score = result.get("risk_score")
+        if isinstance(score, (int, float)):
+            return float(score)
+        nested = result.get("RISK_ASSESSMENT", {}).get("fraud_risk_score")
+        if isinstance(nested, (int, float)):
+            return float(nested)
+    except Exception:
+        return None
+    return None
+
+
+async def _publish_analysis_event(
+    event_type: str,
+    *,
+    document_id: str,
+    document_type: str,
+    file_name: str,
+    user_id: str,
+    tenant_id: str,
+    risk_score: float | None = None,
+    risk_level: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Publish an analysis lifecycle event (non-fatal — never blocks the API)."""
+    try:
+        from app.messaging.domain.envelope import new_event
+        from app.messaging.infrastructure.factory import get_event_publisher
+
+        payload: dict[str, Any] = {
+            "document_id": document_id,
+            "document_type": document_type or "unknown",
+            "file_name": file_name,
+        }
+        if risk_score is not None:
+            payload["risk_score"] = risk_score
+        if risk_level:
+            payload["risk_level"] = risk_level
+        if error:
+            payload["error"] = error
+
+        event = new_event(
+            event_type,
+            payload=payload,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        ok = await get_event_publisher().publish(event)
+        if not ok:
+            logger.warning(
+                "analysis event not published: %s (doc=%s)", event_type, document_id[:8]
+            )
+    except Exception as exc:  # pragma: no cover - events must never fail analysis
+        logger.warning("analysis event publish failed (non-fatal): %s", exc)
 
 
 async def _send_analysis_notification(

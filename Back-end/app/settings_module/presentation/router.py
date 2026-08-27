@@ -295,6 +295,7 @@ async def update_payment_status(
     schedule_id: str,
     status: str = Query(..., pattern="^(paid|cancelled)$"),
     user_id: str = Depends(get_current_user_id),
+    tenant_id: str = Depends(get_current_tenant_id),
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     """Mark a payment schedule as paid or cancelled."""
@@ -317,6 +318,21 @@ async def update_payment_status(
         schedule.status = status
         db.add(schedule)
         await db.commit()
+
+        # ── Publish bill.cancelled / bill.paid (activity history) ──
+        event_type = "bill.cancelled" if status == "cancelled" else "bill.paid"
+        await _publish_bill_event(
+            event_type,
+            schedule_id=schedule_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            payload={
+                "bill_id": schedule_id,
+                "due_date": schedule.due_date.isoformat(),
+                "amount": schedule.amount,
+                "beneficiary": schedule.beneficiary,
+            },
+        )
 
         return {"status": "updated", "schedule_id": schedule_id, "new_status": status}
     except HTTPException:
@@ -408,6 +424,21 @@ async def register_payment_schedule(
         db.add(schedule)
         await db.commit()
 
+        # ── Publish bill.scheduled (activity history) ──
+        await _publish_bill_event(
+            "bill.scheduled",
+            schedule_id=str(schedule.id),
+            user_id=user_id,
+            tenant_id=tenant_id,
+            payload={
+                "bill_id": str(schedule.id),
+                "due_date": body.due_date,
+                "amount": body.amount,
+                "beneficiary": body.beneficiary,
+                "bank_code": body.bank_code,
+            },
+        )
+
         return {
             "status": "registered",
             "schedule_id": str(schedule.id),
@@ -420,3 +451,31 @@ async def register_payment_schedule(
     except Exception as e:
         await db.rollback()
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+async def _publish_bill_event(
+    event_type: str,
+    *,
+    schedule_id: str,
+    user_id: str,
+    tenant_id: str,
+    payload: dict[str, Any],
+) -> None:
+    """Publish a bill lifecycle event to the activity history (non-fatal)."""
+    try:
+        from app.messaging.domain.envelope import new_event
+        from app.messaging.infrastructure.factory import get_event_publisher
+
+        event = new_event(
+            event_type,
+            payload={"bill_id": schedule_id, **payload},
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        await get_event_publisher().publish(event)
+    except Exception as exc:  # pragma: no cover - events must never fail the API
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "bill event publish failed (non-fatal): %s", exc
+        )

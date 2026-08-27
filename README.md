@@ -135,6 +135,7 @@ Fraudulent boletos cause **billions of reais in annual losses** in Brazil. Tradi
 | **Frontend** | Next.js 16.2 (Turbopack), TypeScript, TailwindCSS, Zustand, Framer Motion |
 | **Database** | PostgreSQL 15 + pgvector (Supabase) |
 | **Cache** | Redis (Celery broker, WebSocket Pub/Sub) |
+| **Messaging** | RabbitMQ 4 (topic exchange, retry + DLQ, publisher confirms) |
 | **AI/ML** | CrewAI (multi-agent orchestration), LangChain, Google Gemini 2.5 Flash, BAAI/bge-m3 (embeddings), RecursiveCharacterTextSplitter |
 | **PDF/OCR** | PyMuPDF, pdfplumber, pypdf, Tesseract OCR, pdf2image |
 | **Infrastructure** | Railway (backend), Vercel (frontend), Supabase (DB), Sentry (error tracking) |
@@ -232,6 +233,32 @@ npm run dev
 # Or manually:
 cd Back-end
 poetry run alembic upgrade head
+```
+
+### RabbitMQ (Event-Driven Messaging)
+
+Eventos assíncronos alimentam o Activity History (`/audit-logs`), o Notification
+Center e e-mails transacionais. Arquitetura completa em
+[`Back-end/docs/event_driven_architecture.md`](Back-end/docs/event_driven_architecture.md).
+
+```bash
+cd Back-end
+# RabbitMQ 4 + Postgres + Redis
+docker compose -f docker/docker-compose.yml up -d postgres redis rabbitmq
+
+# Management UI: http://localhost:15672   (psi / psi_secret por padrão)
+# AMQP:          localhost:5672
+
+# API (publishers com confirms)
+python -m uvicorn app.main:create_app --factory --reload
+
+# Workers (processos separados, escaláveis horizontalmente)
+python -m app.workers.audit_worker          # audit_logs (Activity History)
+python -m app.workers.notification_worker   # notificações in-app + WS
+python -m app.workers.email_worker          # e-mails transacionais
+
+# Scheduler — detecta contas próximas do vencimento → bill.due_soon
+python -m app.workers.scheduler
 ```
 
 ### Knowledge Base Ingestion

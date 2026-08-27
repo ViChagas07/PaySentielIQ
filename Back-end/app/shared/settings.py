@@ -50,6 +50,53 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_CACHE_TTL: int = 300
 
+    # ── RabbitMQ / Event-Driven Messaging ──
+    # Master switch. When false, the API uses a no-op publisher and
+    # workers refuse to start (local dev without RabbitMQ stays usable).
+    RABBITMQ_ENABLED: bool = True
+    # amqp(s)://user:pass@host:5672/vhost — credentials come from env, never hardcoded.
+    RABBITMQ_URL: SecretStr = Field(
+        default=SecretStr("amqp://psi:psi_secret@localhost:5672/"),
+    )
+    RABBITMQ_EXCHANGE: str = "sentinel.events"       # main topic exchange
+    RABBITMQ_DLX: str = "sentinel.dlx"               # dead-letter exchange
+    RABBITMQ_CONNECT_TIMEOUT: float = 10.0           # seconds
+    RABBITMQ_HEARTBEAT: int = 60                     # seconds
+    RABBITMQ_PREFETCH_COUNT: int = 10                # per consumer (fair dispatch)
+    # Logical source stamped into every event envelope.
+    EVENT_SOURCE: str = "paysentinel-api"
+    # Retry policy for consumers: max handler attempts before DLQ and
+    # the backoff (seconds) applied per attempt (CSV, last value repeats).
+    EVENT_RETRY_MAX_ATTEMPTS: int = 3
+    EVENT_RETRY_BACKOFF_SECONDS: str = "5,30,120"
+
+    @property
+    def retry_backoff_seconds(self) -> list[int]:
+        """Parse EVENT_RETRY_BACKOFF_SECONDS CSV into a list of ints."""
+        values: list[int] = []
+        for chunk in self.EVENT_RETRY_BACKOFF_SECONDS.split(","):
+            chunk = chunk.strip()
+            if chunk.isdigit():
+                values.append(int(chunk))
+        return values or [5]
+
+    # ── Email (transactional, via workers — never inside HTTP requests) ──
+    EMAIL_ENABLED: bool = False  # false → ConsoleEmailService (logs instead of sending)
+    EMAIL_FROM: str = "SentinelaPay <no-reply@paysentineliq.com>"
+    SMTP_HOST: str = "localhost"
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str | None = None
+    SMTP_PASSWORD: SecretStr | None = None
+    SMTP_USE_TLS: bool = True
+    SMTP_TIMEOUT: float = 15.0
+    # Public URL of the frontend — used to build links inside emails.
+    APP_BASE_URL: str = "http://localhost:3000"
+
+    # ── Bill due-soon scheduler (standalone worker) ──
+    BILL_SCHEDULER_ENABLED: bool = True
+    BILL_SCHEDULER_INTERVAL_SECONDS: int = 3600  # how often the scan runs
+    BILL_DUE_SOON_DAYS: int = 2                  # "due soon" horizon
+
     # ── Celery ──
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"

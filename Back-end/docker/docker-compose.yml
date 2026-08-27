@@ -29,6 +29,29 @@ services:
       timeout: 5s
       retries: 5
 
+  # ── RabbitMQ 4 — event-driven messaging infrastructure ──
+  # Management UI: http://localhost:15672 (guest/guest unless overridden)
+  # AMQP:           localhost:5672
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    environment:
+      # Credentials come from the environment — never hardcode secrets here.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-psi}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-psi_secret}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_DEFAULT_VHOST:-/}
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
   api:
     build:
       context: ..
@@ -46,10 +69,13 @@ services:
       - LLM_PROVIDER=ollama
       - OLLAMA_BASE_URL=http://ollama:11434
       - OLLAMA_MODEL=llama3
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-psi}:${RABBITMQ_DEFAULT_PASS:-psi_secret}@rabbitmq:5672/${RABBITMQ_DEFAULT_VHOST:-/}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     restart: unless-stopped
 
@@ -95,6 +121,92 @@ services:
       - redis
     restart: unless-stopped
 
+  # ══════════════════════════════════════════════════════════
+  # EVENT-DRIVEN WORKERS (RabbitMQ consumers) + SCHEDULER
+  # Each is a separate, horizontally-scalable process.
+  # ══════════════════════════════════════════════════════════
+
+  audit-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: production
+    command: python -m app.workers.audit_worker
+    env_file:
+      - ../.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://psi:psi_secret@postgres:5432/paysentineliq
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-psi}:${RABBITMQ_DEFAULT_PASS:-psi_secret}@rabbitmq:5672/${RABBITMQ_DEFAULT_VHOST:-/}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  notification-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: production
+    command: python -m app.workers.notification_worker
+    env_file:
+      - ../.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://psi:psi_secret@postgres:5432/paysentineliq
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-psi}:${RABBITMQ_DEFAULT_PASS:-psi_secret}@rabbitmq:5672/${RABBITMQ_DEFAULT_VHOST:-/}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  email-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: production
+    command: python -m app.workers.email_worker
+    env_file:
+      - ../.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://psi:psi_secret@postgres:5432/paysentineliq
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-psi}:${RABBITMQ_DEFAULT_PASS:-psi_secret}@rabbitmq:5672/${RABBITMQ_DEFAULT_VHOST:-/}
+      - EMAIL_ENABLED=${EMAIL_ENABLED:-false}
+      - SMTP_HOST=${SMTP_HOST:-mailhog}
+      - SMTP_PORT=${SMTP_PORT:-1025}
+      - SMTP_USE_TLS=${SMTP_USE_TLS:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  scheduler:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: production
+    command: python -m app.workers.scheduler
+    env_file:
+      - ../.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://psi:psi_secret@postgres:5432/paysentineliq
+      - RABBITMQ_URL=amqp://${RABBITMQ_DEFAULT_USER:-psi}:${RABBITMQ_DEFAULT_PASS:-psi_secret}@rabbitmq:5672/${RABBITMQ_DEFAULT_VHOST:-/}
+      - BILL_SCHEDULER_INTERVAL_SECONDS=${BILL_SCHEDULER_INTERVAL_SECONDS:-3600}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ── Ollama — Local LLM Inference (Optional, zero API cost) ──
   # Uncomment this service to run Ollama inside Docker.
   # Alternatively, run Ollama natively on the host and set OLLAMA_BASE_URL=http://host.docker.internal:11434
@@ -122,4 +234,5 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  rabbitmq_data:
   # ollama_data:

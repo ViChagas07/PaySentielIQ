@@ -39,6 +39,27 @@ async def _check_redis() -> dict:
         return {"status": "unhealthy", "error": str(e)}
 
 
+async def _check_rabbitmq() -> dict:
+    """Probe RabbitMQ with a real connection — NOT just 'process alive'."""
+    try:
+        from app.shared.settings import get_settings
+
+        settings = get_settings()
+        if not settings.RABBITMQ_ENABLED:
+            return {"status": "disabled"}
+
+        from app.messaging.infrastructure.rabbitmq_connection import (
+            RabbitMQConnectionManager,
+        )
+
+        manager = RabbitMQConnectionManager()
+        healthy = await manager.health_check()
+        await manager.close()
+        return {"status": "healthy" if healthy else "unhealthy"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}
+
+
 async def _check_llm() -> dict:
     try:
         from app.shared.settings import get_settings
@@ -64,6 +85,8 @@ async def readiness_check() -> dict:
     checks["database"] = db
     redis = await _check_redis()
     checks["redis"] = redis
+    rabbitmq = await _check_rabbitmq()
+    checks["rabbitmq"] = rabbitmq
     healthy = db.get("status") == "healthy"
     return {"status": "ready" if healthy else "not_ready", "checks": checks}
 

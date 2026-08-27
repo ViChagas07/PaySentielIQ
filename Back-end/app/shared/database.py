@@ -6,6 +6,7 @@
 from collections.abc import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
     AsyncSession,
     async_sessionmaker,
     create_async_engine,
@@ -44,6 +45,22 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False,
     autoflush=False,
 )
+
+
+def get_engine() -> AsyncEngine | None:
+    """Return the global async engine (lazy-safe accessor).
+
+    Several modules (health checks, background tasks, messaging workers)
+    import this accessor instead of the module-level ``engine`` symbol so
+    they keep working even if engine creation is deferred or replaced in
+    tests.
+    """
+    return engine
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """Return the global session factory (used by workers and tasks)."""
+    return AsyncSessionLocal
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

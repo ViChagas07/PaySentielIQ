@@ -8,7 +8,6 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
-from typing import Any
 
 from app.observability.correlation import get_correlation
 
@@ -29,6 +28,14 @@ class JSONFormatter(logging.Formatter):
             "function": record.funcName,
             "line": record.lineno,
         }
+        # Structured fields passed via logger.info("...", extra={...}) — e.g.
+        # event_id, queue, duration_ms, retry_count from messaging consumers.
+        _STANDARD_ATTRS = frozenset(
+            logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+        )
+        for key, value in record.__dict__.items():
+            if key not in _STANDARD_ATTRS and not key.startswith("_"):
+                log_entry[key] = value
         if record.exc_info and record.exc_info[1]:
             log_entry["exception"] = str(record.exc_info[1])
             log_entry["stacktrace"] = self.formatException(record.exc_info)

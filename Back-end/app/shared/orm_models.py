@@ -301,9 +301,45 @@ class AuditLogModel(Base):
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
     ip_address: Mapped[str | None] = mapped_column(String(50), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # ── Event-driven audit (RabbitMQ consumer) ──
+    # Deterministic dedupe: the broker may redeliver; event_id is unique so
+    # a given domain event produces exactly one audit row.
+    event_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True, index=True
+    )
+    occurred_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         # NO UPDATE/DELETE — immutable by design
+    )
+
+
+# ============================================================
+# Processed Events (Consumer Idempotency / Inbox)
+# ============================================================
+
+
+class ProcessedEventModel(Base):
+    """Inbox table backing consumer idempotency.
+
+    Every consumer records (event_id, consumer) atomically with its
+    business writes, so redelivered messages never produce duplicate
+    side effects (duplicate audit rows, duplicate emails, ...).
+    """
+
+    __tablename__ = "processed_events"
+
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    consumer: Mapped[str] = mapped_column(String(100), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(150), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("event_id", "consumer", name="uq_processed_event_consumer"),
     )
 
 

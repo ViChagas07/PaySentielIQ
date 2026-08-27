@@ -22,9 +22,13 @@ class NotificationRepository(BaseRepository[NotificationModel]):
         super().__init__(NotificationModel, session)
 
 class NotificationService:
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session: AsyncSession, event_publisher=None):
         self.session = session
         self.repository = NotificationRepository(session)
+        # Optional EventPublisher — publishes `notification.created` for the
+        # activity history. Injected by callers (API/workers); the concrete
+        # RabbitMQ implementation is NEVER imported here.
+        self.event_publisher = event_publisher
 
     async def create_notification(
         self,
@@ -52,8 +56,35 @@ class NotificationService:
         )
         self.session.add(notification)
         await self.session.flush() # Flush to get the ID, but don't commit yet
-        # TODO: Enqueue Celery task for background processing (sending to channels)
+
+        # ── Feed the activity history (async consumers) ──
+        if self.event_publisher is not None:
+            await self._publish_notification_created(notification)
+
         return notification
+
+    async def _publish_notification_created(self, notification: NotificationModel) -> None:
+        """Publish notification.created (non-fatal — never breaks creation)."""
+        try:
+            from app.messaging.domain.envelope import new_event
+            from app.messaging.domain.event_types import EventType
+
+            event = new_event(
+                EventType.NOTIFICATION_CREATED.value,
+                payload={
+                    "notification_id": str(notification.id),
+                    "notification_type": notification.type,
+                },
+                user_id=str(notification.user_id),
+                tenant_id=str(notification.tenant_id),
+            )
+            await self.event_publisher.publish(event)
+        except Exception as exc:  # pragma: no cover - audit must never fail create
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "notification.created publish failed (non-fatal): %s", exc
+            )
 
     async def get_notifications_for_user(
         self,
